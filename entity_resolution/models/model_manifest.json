@@ -1,0 +1,9 @@
+{
+  "model_name": "LightGBM",
+  "model_type": "lightgbm.LGBMClassifier",
+  "path": "models/lightgbm_entity_resolution_v1.joblib",
+  "feature_version": "features_v1",
+  "training_status": "ready_for_colab_training",
+  "created_from": "build_persisted_model.py",
+  "notes": "This project is prepared to generate a persisted LightGBM model in Colab via the build_persisted_model.py script and then use it for final inference."
+}

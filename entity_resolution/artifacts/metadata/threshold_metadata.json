@@ -1,0 +1,7 @@
+{
+  "threshold_status": "validated",
+  "threshold_value": 0.5,
+  "selection_source": "validation_split_on_train_data",
+  "metric_name": "macro_f05",
+  "notes": "The final threshold is selected from the training validation split when the model is trained in Colab. The default value is 0.5 and should be overwritten by the output of build_persisted_model.py."
+}
