@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from itertools import chain
 from typing import Iterable
 
 
@@ -33,14 +34,22 @@ def build_token_index(records: Iterable[dict]) -> dict[str, set[str]]:
 
 def generate_exact_candidates(source1_records: Iterable[dict], source2_records: Iterable[dict], source3_records: Iterable[dict]) -> dict[str, set[str]]:
     candidate_map: dict[str, set[str]] = defaultdict(set)
-    target_records = list(source2_records) + list(source3_records)
-    name_index = build_name_index(target_records)
-    address_index = build_address_index(target_records)
-    country_name_index = defaultdict(set)
-    for row in target_records:
-        key = f"{str(row.get('country','')).strip().lower()}::{str(row.get('name_norm','')).strip().lower()}"
+    name_index: dict[str, list[str]] = defaultdict(list)
+    address_index: dict[str, list[str]] = defaultdict(list)
+    country_name_index: dict[str, set[str]] = defaultdict(set)
+
+    for row in chain(source2_records, source3_records):
+        key = str(row.get("name_norm", "")).strip().lower()
         if key:
-            country_name_index[key].add(str(row["entity_id"]))
+            name_index[key].append(str(row["entity_id"]))
+
+        address_key = str(row.get("address_norm", "")).strip().lower()
+        if address_key:
+            address_index[address_key].append(str(row["entity_id"]))
+
+        country_name_key = f"{str(row.get('country','')).strip().lower()}::{str(row.get('name_norm','')).strip().lower()}"
+        if country_name_key:
+            country_name_index[country_name_key].add(str(row["entity_id"]))
 
     for left in source1_records:
         left_id = str(left["entity_id"])
@@ -57,8 +66,11 @@ def generate_exact_candidates(source1_records: Iterable[dict], source2_records: 
 
 
 def generate_token_candidates(source1_records: Iterable[dict], source2_records: Iterable[dict], source3_records: Iterable[dict], max_candidates: int = 50) -> dict[str, set[str]]:
-    target_records = list(source2_records) + list(source3_records)
-    token_index = build_token_index(target_records)
+    token_index: dict[str, set[str]] = defaultdict(set)
+    for row in chain(source2_records, source3_records):
+        for token in row.get("tokens", []):
+            if token:
+                token_index[token].add(str(row["entity_id"]))
 
     candidates: dict[str, set[str]] = defaultdict(set)
     for left in source1_records:

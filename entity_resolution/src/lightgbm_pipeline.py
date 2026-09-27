@@ -53,9 +53,93 @@ def normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _iter_dict_records(frame: pd.DataFrame) -> Any:
+    for row in frame.itertuples(index=False):
+        values = row._asdict()
+        yield {key: value for key, value in values.items()}
+
+
+def estimate_training_memory_mb(*frames: pd.DataFrame) -> float:
+    total_bytes = 0
+    for frame in frames:
+        total_bytes += int(frame.memory_usage(index=True, deep=True).sum())
+    return total_bytes / (1024 * 1024)
+
+
+def load_limited_target_subset(
+    train_dir: str | Path,
+    truth_map: dict[str, set[str]],
+    max_negative_ids: int = 250,
+    chunk_size: int = 100_000,
+) -> pd.DataFrame:
+    positive_target_ids = {str(entity_id) for entity_ids in truth_map.values() for entity_id in entity_ids}
+    negative_ids: list[str] = []
+    seen_negative = set()
+
+    for file_name in (Path(train_dir) / "train_source2.tsv", Path(train_dir) / "train_source3.tsv"):
+        for chunk in pd.read_csv(
+            file_name,
+            sep="\t",
+            engine="python",
+            on_bad_lines="skip",
+            dtype={"entity_id": "string"},
+            chunksize=max(1, int(chunk_size)),
+        ):
+            for entity_id in chunk["entity_id"].astype(str).tolist():
+                entity_id = str(entity_id)
+                if entity_id in positive_target_ids or entity_id in seen_negative:
+                    continue
+                negative_ids.append(entity_id)
+                seen_negative.add(entity_id)
+                if len(negative_ids) >= max_negative_ids:
+                    break
+            if len(negative_ids) >= max_negative_ids:
+                break
+        if len(negative_ids) >= max_negative_ids:
+            break
+
+    selected_ids = set(positive_target_ids) | set(negative_ids)
+    if not selected_ids:
+        raise ValueError("No target IDs are available for limited training; the ground-truth target overlap is empty.")
+
+    frames: list[pd.DataFrame] = []
+    for file_name in (Path(train_dir) / "train_source2.tsv", Path(train_dir) / "train_source3.tsv"):
+        for chunk in pd.read_csv(
+            file_name,
+            sep="\t",
+            engine="python",
+            on_bad_lines="skip",
+            dtype={"entity_id": "string"},
+            chunksize=max(1, int(chunk_size)),
+        ):
+            filtered = chunk[chunk["entity_id"].astype(str).isin(selected_ids)].copy()
+            if not filtered.empty:
+                frames.append(filtered)
+
+    if not frames:
+        raise ValueError("No target rows remained after bounded sampling for the limited training pass.")
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_limited_training_sample(train_dir: str | Path, limit: int, max_negative_ids: int = 250) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, set[str]]]:
+    truth_df = load_ground_truth(Path(train_dir) / "train_ground_truth.tsv")
+    ordered_ids = list(dict.fromkeys(truth_df["source1_entity_id"].astype(str).tolist()))[:limit]
+    if not ordered_ids:
+        raise ValueError("No source1 IDs were found in the ground-truth set for the bounded train sample.")
+
+    truth_df = truth_df[truth_df["source1_entity_id"].astype(str).isin(ordered_ids)].copy()
+    truth_map = build_truth_map(truth_df)
+    source1_df = load_source_table(Path(train_dir) / "train_source1.tsv", selected_entity_ids=ordered_ids, chunk_size=100_000)
+    if source1_df.empty:
+        raise ValueError("The bounded source1 sample is empty; the selected source1 IDs are missing from the TSV.")
+    source1_df = normalize_frame(source1_df)
+    target_df = load_limited_target_subset(train_dir, truth_map, max_negative_ids=max_negative_ids)
+    return source1_df, normalize_frame(target_df), truth_map
+
+
 def generate_candidate_map(source1_df: pd.DataFrame, target_df: pd.DataFrame, max_candidates: int = 30) -> dict[str, set[str]]:
-    exact = generate_exact_candidates(source1_df.to_dict("records"), target_df.to_dict("records"), [])
-    token = generate_token_candidates(source1_df.to_dict("records"), target_df.to_dict("records"), [], max_candidates=max_candidates)
+    exact = generate_exact_candidates(_iter_dict_records(source1_df), _iter_dict_records(target_df), ())
+    token = generate_token_candidates(_iter_dict_records(source1_df), _iter_dict_records(target_df), (), max_candidates=max_candidates)
     merged = merge_candidate_sets(exact, token)
     output: dict[str, set[str]] = {}
     for entity_id, candidate_ids in merged.items():
@@ -66,6 +150,11 @@ def generate_candidate_map(source1_df: pd.DataFrame, target_df: pd.DataFrame, ma
 
 def build_training_rows(source1_df: pd.DataFrame, target_df: pd.DataFrame, truth_map: dict[str, set[str]], max_candidates: int = 30) -> tuple[list[dict[str, Any]], list[int]]:
     candidate_map = generate_candidate_map(source1_df, target_df, max_candidates=max_candidates)
+    target_by_id: dict[str, dict[str, Any]] = {}
+    for row in target_df.itertuples(index=False):
+        values = row._asdict()
+        target_by_id[str(values["entity_id"])] = {key: value for key, value in values.items()}
+
     feature_rows: list[dict[str, Any]] = []
     labels: list[int] = []
 
@@ -78,10 +167,10 @@ def build_training_rows(source1_df: pd.DataFrame, target_df: pd.DataFrame, truth
         left["name_tokens"] = row.get("name_tokens", [])
         candidate_ids = candidate_map.get(str(source1_id), set())
         for candidate_id in sorted(candidate_ids):
-            match_row = target_df[target_df["entity_id"].astype(str) == str(candidate_id)]
-            if match_row.empty:
+            right = target_by_id.get(str(candidate_id))
+            if right is None:
                 continue
-            right = match_row.iloc[0].to_dict()
+            right = dict(right)
             right["tokens"] = right.get("tokens", [])
             right["name_norm"] = right.get("name_norm", "")
             right["name_compact"] = right.get("name_compact", "")
@@ -252,42 +341,73 @@ def train_lightgbm_only_experiment(
     if not (train_dir / "train_ground_truth.tsv").exists():
         raise FileNotFoundError(f"Missing ground-truth file in {train_dir}")
 
-    truth_df = load_ground_truth(train_dir / "train_ground_truth.tsv")
-    source1_df = normalize_frame(load_source_table(train_dir / "train_source1.tsv"))
-    source2_df = normalize_frame(load_source_table(train_dir / "train_source2.tsv"))
-    source3_df = normalize_frame(load_source_table(train_dir / "train_source3.tsv"))
-    target_df = pd.concat([source2_df, source3_df], ignore_index=True)
-
+    print("[1/6] Loading training data")
     if limit is not None:
-        source1_df = source1_df.head(limit).copy()
-        truth_df = truth_df[truth_df["source1_entity_id"].astype(str).isin(source1_df["entity_id"].astype(str).tolist())].copy()
-        truth_map = build_truth_map(truth_df)
-        source1_df, target_df, truth_map = align_training_subset(source1_df, target_df, truth_map, limit=limit)
+        print(f"Using bounded training sample with limit={limit} and deterministic source1/ground-truth alignment.")
+        source1_df, target_df, truth_map = load_limited_training_sample(train_dir, limit=limit)
+        print(f"Loaded bounded S1 rows={len(source1_df)}, target rows={len(target_df)}, truth entries={len(truth_map)}")
+        print("Target pool is bounded to positive matches plus a deterministic negative sample to reduce Colab memory pressure.")
     else:
+        truth_df = load_ground_truth(train_dir / "train_ground_truth.tsv")
         truth_map = build_truth_map(truth_df)
+        source1_df = normalize_frame(load_source_table(train_dir / "train_source1.tsv"))
+        source2_df = normalize_frame(load_source_table(train_dir / "train_source2.tsv"))
+        source3_df = normalize_frame(load_source_table(train_dir / "train_source3.tsv"))
+        target_df = pd.concat([source2_df, source3_df], ignore_index=True)
+        mem_mb = estimate_training_memory_mb(source1_df, target_df, truth_df)
+        print(f"Loaded full training data: S1={len(source1_df)}, target={len(target_df)}, truth entries={len(truth_map)}")
+        print(f"Estimated memory footprint for training inputs: {mem_mb:.1f} MB")
+        if mem_mb > 1024:
+            print("Warning: the full-data training path may exceed Colab RAM. Use --limit for bounded smoke tests or a chunked target selection strategy in a higher-memory environment.")
 
+    print("[2/6] Building candidate pairs")
     rows, labels = build_training_rows(source1_df, target_df, truth_map, max_candidates=max_candidates)
+    print(f"Generated {len(rows)} candidate pairs; positive={sum(labels)}, negative={len(labels)-sum(labels)}")
+    if sum(labels) == 0 or len(set(labels)) < 2:
+        raise ValueError("Single-class label set after candidate generation. This is a data-alignment issue, not a LightGBM issue.")
 
+    print("[3/6] Preparing feature matrix and validation split")
     feature_frame = pd.DataFrame(rows).fillna(0)
     feature_columns = list(feature_frame.columns)
     y = np.asarray(labels, dtype=int)
-    train_idx, val_idx = train_test_split(
-        np.arange(len(feature_frame)),
-        test_size=0.2,
-        random_state=42,
-        stratify=y,
-    )
+    class_counts = np.bincount(y)
+    if np.unique(y).size < 2:
+        raise ValueError("Single-class label set after candidate generation. This is a data-alignment issue, not a LightGBM issue.")
+    if np.min(class_counts) >= 2:
+        train_idx, val_idx = train_test_split(
+            np.arange(len(feature_frame)),
+            test_size=0.2,
+            random_state=42,
+            stratify=y,
+        )
+    else:
+        print("Warning: the training sample is too small to stratify the validation split; using an unstratified split instead.")
+        train_idx, val_idx = train_test_split(
+            np.arange(len(feature_frame)),
+            test_size=0.2,
+            random_state=42,
+        )
     X_train = feature_frame.iloc[train_idx].copy()
     X_val = feature_frame.iloc[val_idx].copy()
     y_train = y[train_idx]
     y_val = y[val_idx]
 
+    print("[4/6] Training LightGBM model")
     model = train_lightgbm_model(X_train.to_dict("records"), y_train)
     val_prob = model.predict_proba(X_val)[:, 1]
     threshold_grid = config.get("training", {}).get("threshold_grid", [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9])
-    best_threshold, best_f05 = optimize_threshold(val_prob, y_val, threshold_grid)
+    if np.unique(y_val).size < 2:
+        print("Warning: validation labels contain only one class; falling back to a default threshold of 0.5.")
+        best_threshold = 0.5
+        best_f05 = 0.0
+    else:
+        best_threshold, best_f05 = optimize_threshold(val_prob, y_val, threshold_grid)
+    print(f"Validation F0.5={best_f05:.4f} with threshold={best_threshold:.3f}")
+
+    print("[5/6] Saving model artifacts")
     save_lightgbm_artifacts(model, feature_columns, best_threshold, best_f05, model_dir, artifact_dir)
 
+    print("[6/6] Finalizing training summary")
     return {
         "project_root": str(project_root),
         "data_root": str(data_root) if data_root is not None else str(resolved["data_root"]),
