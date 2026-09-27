@@ -1,14 +1,18 @@
 project:
   name: entity_resolution
-  experiment_id: er_v1
+  experiment_id: er_lightgbm_v1
   random_seed: 42
 
 paths:
+  project_root: .
   dataset_root: ../6ab10eb3b23ba_student_resource/student_resource
   train_dir: ../6ab10eb3b23ba_student_resource/student_resource/dataset/train
   test_dir: ../6ab10eb3b23ba_student_resource/student_resource/dataset/test
+  drive_root: /content/drive/MyDrive/amazon_ml
+  raw_data_dir: /content/drive/MyDrive/amazon_ml/data/raw
   output_dir: outputs
   model_dir: models
+  artifact_dir: artifacts
   cache_dir: data/processed
   embedding_dir: data/embeddings
   candidate_dir: data/candidates
@@ -38,15 +42,15 @@ blocking:
   e5_top_k: 15
 
 training:
-  validation_fraction: 0.1
+  validation_fraction: 0.2
   positive_downsample_ratio: 0.15
   hard_negative_ratio: 0.35
   threshold_grid: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
 
 models:
-  use_xgboost: true
-  use_catboost: true
+  use_xgboost: false
+  use_catboost: false
   use_lightgbm: true
-  use_logistic: true
+  use_logistic: false
   use_cross_encoder: false
   use_bge: false

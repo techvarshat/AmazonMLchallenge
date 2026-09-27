@@ -1,0 +1,17 @@
+# CORE REQUIRED PACKAGES
+numpy>=1.26
+pandas>=2.1
+PyYAML>=6.0
+scikit-learn>=1.4
+lightgbm>=4.3
+xgboost>=2.0
+catboost>=1.2
+rapidfuzz>=3.9
+joblib>=1.1
+tqdm>=4.66
+
+# OPTIONAL PACKAGES
+psutil>=5.9
+faiss-cpu>=1.8
+sentence-transformers>=3.0
+transformers>=4.40

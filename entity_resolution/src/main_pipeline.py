@@ -15,8 +15,8 @@ from .data_loader import load_ground_truth, load_source_table
 from .evaluation import macro_f05_score
 from .normalization import compact_text, normalize_text, strip_business_suffixes, token_list
 from .pair_features import build_pair_features
+from .threshold_optimization import optimize_threshold
 from .train_lgbm import train_lightgbm_model
-from .train_logistic import train_logistic_model
 
 
 def _normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -137,7 +137,7 @@ def main() -> None:
     candidate_map = _generate_candidate_pairs(s1, target, max_candidates=25)
     print(f"Generated candidates for {len(candidate_map)} S1 entities; median candidates={np.median([len(v) for v in candidate_map.values()]) if candidate_map else 0}")
 
-    print("[4/6] Training baseline models")
+    print("[4/6] Training LightGBM-only model")
     rows, labels = _build_training_rows(s1, target, truth_map, max_candidates=25)
     feature_frame = pd.DataFrame(rows)
     feature_frame = feature_frame.fillna(0)
@@ -148,18 +148,15 @@ def main() -> None:
     y_val = np.asarray([labels[i] for i in val_idx])
 
     if np.unique(y_train).size < 2 or np.unique(y_val).size < 2:
-        print("Warning: reduced smoke-test sample does not contain both classes; skipping binary model training for this subset.")
+        print("Warning: reduced smoke-test sample does not contain both classes; using default threshold 0.5.")
         val_metrics = 0.0
+        best_threshold = 0.5
     else:
-        logistic_model = train_logistic_model(X_train.to_dict("records"), y_train)
         lgb_model = train_lightgbm_model(X_train.to_dict("records"), y_train)
-
-        logistic_prob = logistic_model.predict_proba(X_val)[:, 1]
         lgb_prob = lgb_model.predict_proba(X_val)[:, 1]
-
-        val_pred = np.maximum(logistic_prob, lgb_prob)
-        val_metrics = macro_f05_score(y_val, val_pred)
-        print(f"Validation macro F0.5 = {val_metrics:.4f}")
+        best_threshold, best_f05 = optimize_threshold(lgb_prob, y_val, [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9])
+        val_metrics = best_f05
+        print(f"Validation F0.5 = {val_metrics:.4f} using threshold={best_threshold:.2f}")
 
     print("[5/6] Ranking check")
     best_candidate = []
