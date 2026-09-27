@@ -16,6 +16,12 @@ def train_lightgbm_model(feature_rows: Iterable[Dict[str, Any]], target: Iterabl
         raise ImportError("lightgbm is not installed. Install dependencies from requirements.txt.")
     X = pd.DataFrame(feature_rows).fillna(0)
     y = np.asarray(list(target), dtype=int)
+    classes = np.unique(y)
+    if classes.size < 2:
+        raise ValueError(
+            "Training labels contain only one class after candidate generation and validation splitting. "
+            "Check the truth-map to candidate-id overlap and do not train on an all-negative subset."
+        )
     model = lgb.LGBMClassifier(
         objective="binary",
         n_estimators=200,

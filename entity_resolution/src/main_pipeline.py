@@ -116,9 +116,19 @@ def main() -> None:
             if pd.isna(matched) or not str(matched).strip():
                 continue
             selected_target_ids.update({x.strip() for x in str(matched).split(",") if x.strip()})
-        s1 = _normalize_frame(load_source_table(train_dir / "train_source1.tsv", nrows=args.limit))
-        s2 = _normalize_frame(load_source_table(train_dir / "train_source2.tsv", nrows=args.limit))
-        s3 = _normalize_frame(load_source_table(train_dir / "train_source3.tsv", nrows=args.limit))
+        s1 = _normalize_frame(load_source_table(train_dir / "train_source1.tsv"))
+        s2 = _normalize_frame(load_source_table(train_dir / "train_source2.tsv"))
+        s3 = _normalize_frame(load_source_table(train_dir / "train_source3.tsv"))
+        s1 = s1[s1["entity_id"].astype(str).isin(selected_s1_ids)].copy()
+        target_ids = set(pd.concat([s2, s3], ignore_index=True)["entity_id"].astype(str).tolist())
+        sampled_target_ids = selected_target_ids & target_ids
+        if not sampled_target_ids:
+            raise ValueError(
+                "The --limit subset does not contain any valid ground-truth target IDs in the sampled target tables; this creates an all-negative label set. "
+                "Use a larger limit or remove --limit to keep truth and target data aligned."
+            )
+        s2 = s2[s2["entity_id"].astype(str).isin(sampled_target_ids | set(list(target_ids - selected_target_ids)[:50]))].copy()
+        s3 = s3[s3["entity_id"].astype(str).isin(sampled_target_ids | set(list(target_ids - selected_target_ids)[:50]))].copy()
         truth = limited_truth[limited_truth["source1_entity_id"].astype(str).isin(selected_s1_ids)].copy()
     else:
         s1 = _normalize_frame(load_source_table(train_dir / "train_source1.tsv"))

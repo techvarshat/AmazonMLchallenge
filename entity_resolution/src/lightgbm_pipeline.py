@@ -92,7 +92,48 @@ def build_training_rows(source1_df: pd.DataFrame, target_df: pd.DataFrame, truth
 
     if not feature_rows:
         raise ValueError("No positive or negative training rows were generated from the challenge data.")
+    unique_labels = set(labels)
+    if len(unique_labels) < 2:
+        raise ValueError(
+            "Training labels contain only one class after candidate generation. "
+            "This usually means the selected subset or candidate-generation window excluded valid matches; "
+            "check the truth-map to candidate-id overlap before training."
+        )
     return feature_rows, labels
+
+
+def align_training_subset(
+    source1_df: pd.DataFrame,
+    target_df: pd.DataFrame,
+    truth_map: dict[str, set[str]],
+    limit: int | None = None,
+    max_negative_ids: int = 100,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, set[str]]]:
+    if limit is None:
+        return source1_df, target_df, truth_map
+
+    truth_keys = [s1_id for s1_id in truth_map if str(s1_id) in source1_df["entity_id"].astype(str).tolist()]
+    selected_s1_ids = truth_keys[:limit]
+    if not selected_s1_ids:
+        raise ValueError("No ground-truth source1 rows are available in the selected subset.")
+
+    selected_truth_map = {str(s1_id): set(truth_map[str(s1_id)]) for s1_id in selected_s1_ids}
+    valid_target_ids = set().union(*selected_truth_map.values()) if selected_truth_map else set()
+    valid_target_ids = {str(target_id) for target_id in valid_target_ids if str(target_id) in set(target_df["entity_id"].astype(str))}
+    if not valid_target_ids:
+        raise ValueError(
+            "The sampled truth rows do not overlap with the sampled target tables. "
+            "This is why a --limit run can create all-negative labels. "
+            "Keep the source1 truth subset aligned with the matching target IDs or remove the limit."
+        )
+
+    negative_pool = [str(candidate_id) for candidate_id in target_df["entity_id"].astype(str).tolist() if candidate_id not in valid_target_ids]
+    negative_ids = set(negative_pool[:max_negative_ids])
+    selected_target_ids = valid_target_ids | negative_ids
+
+    selected_source1 = source1_df[source1_df["entity_id"].astype(str).isin(selected_s1_ids)].copy()
+    selected_target = target_df[target_df["entity_id"].astype(str).isin(selected_target_ids)].copy()
+    return selected_source1, selected_target, selected_truth_map
 
 
 def resolve_data_paths(config: dict[str, Any], data_root: str | Path | None = None) -> dict[str, Path]:
@@ -212,13 +253,19 @@ def train_lightgbm_only_experiment(
         raise FileNotFoundError(f"Missing ground-truth file in {train_dir}")
 
     truth_df = load_ground_truth(train_dir / "train_ground_truth.tsv")
-    if limit is not None:
-        truth_df = truth_df.head(limit).copy()
-    source1_df = normalize_frame(load_source_table(train_dir / "train_source1.tsv", nrows=limit))
-    source2_df = normalize_frame(load_source_table(train_dir / "train_source2.tsv", nrows=limit))
-    source3_df = normalize_frame(load_source_table(train_dir / "train_source3.tsv", nrows=limit))
+    source1_df = normalize_frame(load_source_table(train_dir / "train_source1.tsv"))
+    source2_df = normalize_frame(load_source_table(train_dir / "train_source2.tsv"))
+    source3_df = normalize_frame(load_source_table(train_dir / "train_source3.tsv"))
     target_df = pd.concat([source2_df, source3_df], ignore_index=True)
-    truth_map = build_truth_map(truth_df)
+
+    if limit is not None:
+        source1_df = source1_df.head(limit).copy()
+        truth_df = truth_df[truth_df["source1_entity_id"].astype(str).isin(source1_df["entity_id"].astype(str).tolist())].copy()
+        truth_map = build_truth_map(truth_df)
+        source1_df, target_df, truth_map = align_training_subset(source1_df, target_df, truth_map, limit=limit)
+    else:
+        truth_map = build_truth_map(truth_df)
+
     rows, labels = build_training_rows(source1_df, target_df, truth_map, max_candidates=max_candidates)
 
     feature_frame = pd.DataFrame(rows).fillna(0)
