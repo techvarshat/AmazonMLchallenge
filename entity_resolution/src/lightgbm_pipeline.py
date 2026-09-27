@@ -9,7 +9,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import yaml
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 
 from .blocking import generate_exact_candidates, generate_token_candidates, merge_candidate_sets
 from .data_loader import load_ground_truth, load_source_table
@@ -148,7 +148,7 @@ def generate_candidate_map(source1_df: pd.DataFrame, target_df: pd.DataFrame, ma
     return output
 
 
-def build_training_rows(source1_df: pd.DataFrame, target_df: pd.DataFrame, truth_map: dict[str, set[str]], max_candidates: int = 30) -> tuple[list[dict[str, Any]], list[int]]:
+def build_training_rows(source1_df: pd.DataFrame, target_df: pd.DataFrame, truth_map: dict[str, set[str]], max_candidates: int = 30) -> tuple[list[dict[str, Any]], list[int], list[str]]:
     candidate_map = generate_candidate_map(source1_df, target_df, max_candidates=max_candidates)
     target_by_id: dict[str, dict[str, Any]] = {}
     for row in target_df.itertuples(index=False):
@@ -157,6 +157,7 @@ def build_training_rows(source1_df: pd.DataFrame, target_df: pd.DataFrame, truth
 
     feature_rows: list[dict[str, Any]] = []
     labels: list[int] = []
+    groups: list[str] = []
 
     for source1_id, row in source1_df.set_index("entity_id").iterrows():
         left = row.to_dict()
@@ -178,6 +179,7 @@ def build_training_rows(source1_df: pd.DataFrame, target_df: pd.DataFrame, truth
             right["name_tokens"] = right.get("name_tokens", [])
             feature_rows.append(build_pair_features(left, right))
             labels.append(int(str(candidate_id) in truth_map.get(str(source1_id), set())))
+            groups.append(str(source1_id))
 
     if not feature_rows:
         raise ValueError("No positive or negative training rows were generated from the challenge data.")
@@ -188,7 +190,7 @@ def build_training_rows(source1_df: pd.DataFrame, target_df: pd.DataFrame, truth
             "This usually means the selected subset or candidate-generation window excluded valid matches; "
             "check the truth-map to candidate-id overlap before training."
         )
-    return feature_rows, labels
+    return feature_rows, labels, groups
 
 
 def align_training_subset(
@@ -361,7 +363,7 @@ def train_lightgbm_only_experiment(
             print("Warning: the full-data training path may exceed Colab RAM. Use --limit for bounded smoke tests or a chunked target selection strategy in a higher-memory environment.")
 
     print("[2/6] Building candidate pairs")
-    rows, labels = build_training_rows(source1_df, target_df, truth_map, max_candidates=max_candidates)
+    rows, labels, groups = build_training_rows(source1_df, target_df, truth_map, max_candidates=max_candidates)
     print(f"Generated {len(rows)} candidate pairs; positive={sum(labels)}, negative={len(labels)-sum(labels)}")
     if sum(labels) == 0 or len(set(labels)) < 2:
         raise ValueError("Single-class label set after candidate generation. This is a data-alignment issue, not a LightGBM issue.")
@@ -370,27 +372,52 @@ def train_lightgbm_only_experiment(
     feature_frame = pd.DataFrame(rows).fillna(0)
     feature_columns = list(feature_frame.columns)
     y = np.asarray(labels, dtype=int)
-    class_counts = np.bincount(y)
-    if np.unique(y).size < 2:
-        raise ValueError("Single-class label set after candidate generation. This is a data-alignment issue, not a LightGBM issue.")
-    if np.min(class_counts) >= 2:
-        train_idx, val_idx = train_test_split(
-            np.arange(len(feature_frame)),
-            test_size=0.2,
-            random_state=42,
-            stratify=y,
+    groups_array = np.asarray(groups)
+
+    if len(groups_array) != len(y):
+        raise ValueError("Group count does not match the number of training rows.")
+
+    if len(np.unique(groups_array)) < 2:
+        raise ValueError("Not enough distinct source1 entities for grouped validation.")
+
+    splitter = GroupShuffleSplit(
+        n_splits=30,
+        test_size=0.2,
+        random_state=42,
+    )
+
+    split_found = False
+    for train_idx, val_idx in splitter.split(
+        feature_frame,
+        y,
+        groups=groups_array,
+    ):
+        if (
+            len(np.unique(y[train_idx])) == 2
+            and len(np.unique(y[val_idx])) == 2
+        ):
+            split_found = True
+            break
+
+    if not split_found:
+        raise ValueError(
+            "Could not create a grouped validation split containing "
+            "both classes in training and validation. "
+            "Increase the sample size."
         )
-    else:
-        print("Warning: the training sample is too small to stratify the validation split; using an unstratified split instead.")
-        train_idx, val_idx = train_test_split(
-            np.arange(len(feature_frame)),
-            test_size=0.2,
-            random_state=42,
-        )
+
+    assert set(groups_array[train_idx]).isdisjoint(set(groups_array[val_idx]))
+
     X_train = feature_frame.iloc[train_idx].copy()
     X_val = feature_frame.iloc[val_idx].copy()
     y_train = y[train_idx]
     y_val = y[val_idx]
+
+    print(
+        f"Grouped split: train groups={len(np.unique(groups_array[train_idx]))}, "
+        f"validation groups={len(np.unique(groups_array[val_idx]))}"
+    )
+    print(f"Train positives={int(y_train.sum())}, validation positives={int(y_val.sum())}")
 
     print("[4/6] Training LightGBM model")
     model = train_lightgbm_model(X_train.to_dict("records"), y_train)

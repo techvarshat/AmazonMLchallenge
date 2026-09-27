@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
+from sklearn.model_selection import GroupShuffleSplit
 
 from src.lightgbm_pipeline import (
     build_truth_map,
@@ -22,6 +24,7 @@ def _write_small_train_dataset(path):
             {"entity_id": "S1-1", "business_name": "Acme Corp", "business_address": "1 Main St", "country": "US"},
             {"entity_id": "S1-2", "business_name": "Zeta Labs", "business_address": "2 Oak Ave", "country": "US"},
             {"entity_id": "S1-3", "business_name": "Gamma Tech", "business_address": "3 Pine Rd", "country": "CA"},
+            {"entity_id": "S1-4", "business_name": "Delta Works", "business_address": "4 Cedar Ave", "country": "US"},
         ]
     ).to_csv(train_dir / "train_source1.tsv", sep="\t", index=False)
     pd.DataFrame(
@@ -39,8 +42,9 @@ def _write_small_train_dataset(path):
     pd.DataFrame(
         [
             {"source1_entity_id": "S1-1", "matched_entity_ids": "T2-1"},
-            {"source1_entity_id": "S1-2", "matched_entity_ids": "T2-3"},
             {"source1_entity_id": "S1-3", "matched_entity_ids": ""},
+            {"source1_entity_id": "S1-2", "matched_entity_ids": "T2-3"},
+            {"source1_entity_id": "S1-4", "matched_entity_ids": ""},
         ]
     ).to_csv(train_dir / "train_ground_truth.tsv", sep="\t", index=False)
     return train_dir
@@ -74,10 +78,11 @@ def test_build_training_rows_keeps_positive_labels_when_matches_exist():
     source1_norm = normalize_frame(source1)
     target_norm = normalize_frame(target)
     truth_map = {"S1-1": {"S2-10"}, "S1-2": set()}
-    rows, labels = build_training_rows(source1_norm, target_norm, truth_map, max_candidates=10)
-    assert len(rows) == len(labels)
+    rows, labels, groups = build_training_rows(source1_norm, target_norm, truth_map, max_candidates=10)
+    assert len(rows) == len(labels) == len(groups)
     assert 1 in labels
     assert labels.count(1) > 0
+    assert set(groups) <= {"S1-1", "S1-2"}
 
 
 def test_train_lgbm_raises_on_single_class():
@@ -85,6 +90,35 @@ def test_train_lgbm_raises_on_single_class():
 
     with pytest.raises(ValueError, match="only one class"):
         train_lightgbm_model([{"a": 1}, {"a": 2}], [1, 1])
+
+
+def test_grouped_split_keeps_source1_entities_out_of_both_splits():
+    feature_frame = pd.DataFrame(
+        [
+            {"sim_score": 0.99, "name_overlap": 1.0},
+            {"sim_score": 0.88, "name_overlap": 0.6},
+            {"sim_score": 0.10, "name_overlap": 0.0},
+            {"sim_score": 0.12, "name_overlap": 0.0},
+        ]
+    )
+    y = np.asarray([1, 1, 0, 0], dtype=int)
+    groups_array = np.asarray(["S1-1", "S1-2", "S1-3", "S1-4"])
+
+    splitter = GroupShuffleSplit(
+        n_splits=60,
+        test_size=0.5,
+        random_state=42,
+    )
+    found = False
+    for train_idx, val_idx in splitter.split(feature_frame, y, groups=groups_array):
+        if len(np.unique(y[train_idx])) == 2 and len(np.unique(y[val_idx])) == 2:
+            found = True
+            assert set(groups_array[train_idx]).isdisjoint(set(groups_array[val_idx]))
+            break
+
+    assert found
+    assert "source1_id" not in feature_frame.columns
+    assert "entity_id" not in feature_frame.columns
 
 
 def test_limit_mismatch_errors_when_truth_and_target_do_not_overlap():
@@ -99,10 +133,10 @@ def test_limit_mismatch_errors_when_truth_and_target_do_not_overlap():
 
 def test_limited_training_sample_keeps_truth_alignment(tmp_path):
     train_dir = _write_small_train_dataset(tmp_path)
-    source1_df, target_df, truth_map = load_limited_training_sample(train_dir, limit=2)
+    source1_df, target_df, truth_map = load_limited_training_sample(train_dir, limit=4)
 
-    assert set(source1_df["entity_id"]) == {"S1-1", "S1-2"}
-    assert set(truth_map) == {"S1-1", "S1-2"}
+    assert set(source1_df["entity_id"]) == {"S1-1", "S1-3", "S1-2", "S1-4"}
+    assert set(truth_map) == {"S1-1", "S1-3", "S1-2", "S1-4"}
     assert {"T2-1", "T2-3"}.issubset(set(target_df["entity_id"]))
 
 
@@ -135,7 +169,7 @@ def test_train_lightgbm_only_experiment_smoke_runs_on_small_synthetic_data(tmp_p
         model_dir=tmp_path / "models",
         artifact_dir=tmp_path / "artifacts",
         max_candidates=10,
-        limit=2,
+        limit=4,
     )
     assert result["n_training_rows"] > 0
     assert result["threshold"] > 0
